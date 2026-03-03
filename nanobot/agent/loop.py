@@ -191,10 +191,10 @@ class AgentLoop:
         while iteration < self.max_iterations:
             iteration += 1
 
-            # Use streaming when: has progress callback AND no tools available
-            # (tools need full response to parse tool_calls)
+            # Stream only on first iteration - allows real-time output while
+            # still collecting tool_calls. After tool calls, use draft-based streaming.
+            stream_this_turn = on_progress is not None and iteration == 1
             has_tools = bool(self.tools.get_definitions())
-            use_stream = on_progress is not None and not has_tools
 
             response = await self.provider.chat(
                 messages=messages,
@@ -203,32 +203,9 @@ class AgentLoop:
                 temperature=self.temperature,
                 max_tokens=self.max_tokens,
                 reasoning_effort=self.reasoning_effort,
-                stream=use_stream,
+                stream=stream_this_turn,
+                on_stream_chunk=on_progress if stream_this_turn else None,
             )
-
-            # Handle streaming response - collect chunks in real-time
-            if use_stream and hasattr(response, '__aiter__'):
-                full_content = ""
-                finish_reason = "stop"
-
-                async for chunk in response:
-                    if chunk.choices[0].delta.content:
-                        content = chunk.choices[0].delta.content
-                        full_content += content
-                        # Stream to user immediately
-                        if on_progress:
-                            await on_progress(content)
-
-                    if chunk.choices[0].finish_reason:
-                        finish_reason = chunk.choices[0].finish_reason
-
-                # Build LLMResponse from collected stream
-                from nanobot.providers.base import LLMResponse
-                response = LLMResponse(
-                    content=full_content,
-                    tool_calls=[],
-                    finish_reason=finish_reason,
-                )
 
             if response.has_tool_calls:
                 if on_progress:
