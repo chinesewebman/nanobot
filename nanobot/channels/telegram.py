@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import time
 
 from loguru import logger
 from telegram import BotCommand, ReplyParameters, Update
@@ -130,6 +131,10 @@ class TelegramChannel(BaseChannel):
         self._typing_tasks: dict[str, asyncio.Task] = {}  # chat_id -> typing loop task
         self._media_group_buffers: dict[str, dict] = {}
         self._media_group_tasks: dict[str, asyncio.Task] = {}
+        # Streaming draft support
+        self._draft_ids: dict[str, int] = {}  # chat_id -> current draft_id
+        self._draft_contents: dict[str, str] = {}  # chat_id -> last sent draft content
+        self._draft_locks: dict[str, asyncio.Lock] = {}  # chat_id -> lock for draft operations
 
     async def start(self) -> None:
         """Start the Telegram bot with long polling."""
@@ -220,12 +225,25 @@ class TelegramChannel(BaseChannel):
         return "document"
 
     async def send(self, msg: OutboundMessage) -> None:
-        """Send a message through Telegram."""
+        """Send a message through Telegram.
+
+        If metadata contains '_progress' key, uses send_message_draft for streaming.
+        Otherwise sends a regular message.
+        """
         if not self._app:
             logger.warning("Telegram bot not running")
             return
 
+        # Handle streaming progress messages with send_message_draft
+        is_progress = msg.metadata.get("_progress", False)
+
+        if is_progress:
+            await self._send_draft(msg)
+            return
+
+        # Final message - stop typing and clear any draft
         self._stop_typing(msg.chat_id)
+        await self._clear_draft(msg.chat_id)
 
         try:
             chat_id = int(msg.chat_id)
@@ -485,6 +503,73 @@ class TelegramChannel(BaseChannel):
             pass
         except Exception as e:
             logger.debug("Typing indicator stopped for {}: {}", chat_id, e)
+
+    async def _send_draft(self, msg: OutboundMessage) -> None:
+        """Send a streaming draft message using send_message_draft API.
+
+        This creates an animated "typing" effect showing partial content
+        as it's being generated, using Telegram's native draft streaming.
+        Falls back to typing indicator if stream_drafts is disabled.
+        """
+        if not self._app:
+            return
+
+        # Check if streaming drafts are enabled
+        if not self.config.stream_drafts:
+            # Fall back to typing indicator only
+            self._start_typing(msg.chat_id)
+            return
+
+        try:
+            chat_id = int(msg.chat_id)
+        except ValueError:
+            logger.error("Invalid chat_id for draft: {}", msg.chat_id)
+            return
+
+        # Get or create lock for this chat
+        if chat_id not in self._draft_locks:
+            self._draft_locks[chat_id] = asyncio.Lock()
+
+        async with self._draft_locks[chat_id]:
+            # Get or create draft_id for this chat (increments for each new conversation)
+            if chat_id not in self._draft_ids:
+                self._draft_ids[chat_id] = int(time.time() * 1000) % 1000000
+
+            draft_id = self._draft_ids[chat_id]
+
+            # Skip if content hasn't changed significantly
+            last_content = self._draft_contents.get(chat_id, "")
+            if msg.content == last_content or (
+                len(msg.content) < 50 and msg.content.startswith(last_content)
+            ):
+                return
+
+            # Limit content length for draft (Telegram has limits)
+            draft_text = msg.content[:4000] if len(msg.content) > 4000 else msg.content
+
+            # Convert markdown to HTML for better formatting
+            html = _markdown_to_telegram_html(draft_text)
+
+            try:
+                await self._app.bot.send_message_draft(
+                    chat_id=chat_id,
+                    draft_id=draft_id,
+                    text=html,
+                    parse_mode="HTML",
+                )
+                self._draft_contents[chat_id] = msg.content
+            except Exception as e:
+                logger.debug("Draft send failed (non-critical): {}", e)
+
+    async def _clear_draft(self, chat_id: str) -> None:
+        """Clear draft state after final message is sent."""
+        try:
+            cid = int(chat_id)
+            self._draft_contents.pop(cid, None)
+            # Generate new draft_id for next conversation
+            self._draft_ids[cid] = int(time.time() * 1000) % 1000000
+        except ValueError:
+            pass
 
     async def _on_error(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Log polling / handler errors instead of silently swallowing them."""
