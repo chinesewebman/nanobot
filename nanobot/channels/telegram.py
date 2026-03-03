@@ -253,10 +253,12 @@ class TelegramChannel(BaseChannel):
             logger.error("Invalid chat_id: {}", msg.chat_id)
             return
 
-        had_draft = chat_id in self._draft_contents and self._draft_contents[chat_id]
+        had_draft = self._draft_contents.get(chat_id, False)
+        logger.info(f"[TELEGRAM] Final message check: chat_id={chat_id}, had_draft={had_draft}, draft_contents_keys={list(self._draft_contents.keys())}")
 
         if had_draft:
             # Finalize draft (send permanent message and clear draft state)
+            logger.info(f"[TELEGRAM] Calling _finalize_draft for chat_id={chat_id}")
             await self._finalize_draft(msg)
             return  # Important: return to avoid duplicate send
 
@@ -561,13 +563,13 @@ class TelegramChannel(BaseChannel):
             if not msg.content or not msg.content.strip():
                 return
 
-            # ACCUMULATE: msg.content is incremental chunk, append to previous
-            last_content = self._draft_contents.get(chat_id, "")
-            accumulated = last_content + msg.content
-            logger.debug(f"[TELEGRAM DEBUG] Accumulated: last={len(last_content)}, chunk={len(msg.content)}, total={len(accumulated)}")
+            # msg.content is ALREADY accumulated by LiteLLMProvider._stream_chat()
+            # No need to accumulate here - just use it directly
+            accumulated = msg.content
+            logger.debug(f"[TELEGRAM DEBUG] Using accumulated content from LLM: len={len(accumulated)}")
 
-            # Check if this is a new message (no previous draft content)
-            is_new_message = not last_content
+            # Check if this is a new message (no existing draft_id for this chat)
+            is_new_message = chat_id not in self._draft_ids
 
             # Generate unique draft_id ONLY for new messages
             # Keep the same draft_id for subsequent updates of the same message
@@ -596,12 +598,19 @@ class TelegramChannel(BaseChannel):
 
             # Skip if too soon (unless it's the first chunk)
             if now - last_time < min_interval and not is_new_message:
-                # Still accumulate content even if we skip sending
-                self._draft_contents[chat_id] = accumulated
+                # Skip sending but mark that we have a draft
+                self._draft_contents[chat_id] = True
                 return
 
+            # Don't send the last few characters - leave that for finalize
+            # This prevents duplicate display (draft + finalize both showing full content)
+            if len(accumulated) > 50:
+                draft_text = accumulated[:-10]  # Leave last 10 chars for finalize
+            else:
+                draft_text = accumulated  # For short messages, send all to draft
+
             # Limit content length for draft (Telegram has limits)
-            draft_text = accumulated[:4000] if len(accumulated) > 4000 else accumulated
+            draft_text = draft_text[:4000] if len(draft_text) > 4000 else draft_text
 
             # Convert markdown to HTML for better formatting
             html = _markdown_to_telegram_html(draft_text)
@@ -615,7 +624,8 @@ class TelegramChannel(BaseChannel):
                     parse_mode="HTML",
                 )
                 logger.debug(f"[TELEGRAM DEBUG] Draft sent successfully!")
-                self._draft_contents[chat_id] = accumulated  # Store accumulated content
+                logger.info(f"[TELEGRAM] Draft sent and marked: chat_id={chat_id}")
+                self._draft_contents[chat_id] = True  # Mark that we have a draft
                 self._draft_ids[chat_id] = draft_id  # Store current draft_id for finalization
                 self._last_draft_time[chat_id] = time.time()  # Track for rate limiting
             except Exception as e:
@@ -643,11 +653,11 @@ class TelegramChannel(BaseChannel):
             return
 
         # Check if we had a draft for this chat
-        had_draft = chat_id in self._draft_contents and self._draft_contents[chat_id]
+        had_draft = self._draft_contents.get(chat_id, False)
 
         # If we had a draft, send the final message to make it permanent
         if had_draft:
-            logger.debug("Finalizing draft for chat {}", chat_id)
+            logger.info(f"[TELEGRAM] _finalize_draft: sending permanent message for chat_id={chat_id}, content_len={len(msg.content) if msg.content else 0}")
 
             # Send the final permanent message
             if msg.content and msg.content != "[empty message]":
