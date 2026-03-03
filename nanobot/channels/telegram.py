@@ -656,6 +656,7 @@ class TelegramChannel(BaseChannel):
         draft_id = self._draft_ids.get(chat_id)
 
         # Step 1: Clear the draft by sending empty content
+        # This makes the draft disappear before we send the permanent message
         if draft_id:
             try:
                 logger.info(f"[TELEGRAM] Clearing draft with empty content: chat_id={chat_id}")
@@ -664,7 +665,9 @@ class TelegramChannel(BaseChannel):
                     draft_id=draft_id,
                     text="",
                 )
-                logger.info(f"[TELEGRAM] Draft cleared successfully")
+                logger.info(f"[TELEGRAM] Draft cleared, waiting 500ms before sending permanent message")
+                # Wait for draft to disappear from user's view
+                await asyncio.sleep(0.5)  # 500ms delay
             except Exception as e:
                 logger.warning("[TELEGRAM] Failed to clear draft: {}", e)
 
