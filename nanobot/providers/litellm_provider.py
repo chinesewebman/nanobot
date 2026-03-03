@@ -1,9 +1,10 @@
 """LiteLLM provider implementation for multi-provider support."""
 
+import json
 import os
 import secrets
 import string
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 import json_repair
 import litellm
@@ -186,6 +187,8 @@ class LiteLLMProvider(LLMProvider):
         max_tokens: int = 4096,
         temperature: float = 0.7,
         reasoning_effort: str | None = None,
+        stream: bool = False,
+        on_stream_chunk: Callable[[str], Awaitable[None]] | None = None,
     ) -> LLMResponse:
         """
         Send a chat completion request via LiteLLM.
@@ -196,6 +199,8 @@ class LiteLLMProvider(LLMProvider):
             model: Model identifier (e.g., 'anthropic/claude-sonnet-4-5').
             max_tokens: Maximum tokens in response.
             temperature: Sampling temperature.
+            stream: Enable streaming mode.
+            on_stream_chunk: Callback for each streamed chunk (async).
 
         Returns:
             LLMResponse with content and/or tool calls.
@@ -242,7 +247,16 @@ class LiteLLMProvider(LLMProvider):
             kwargs["tool_choice"] = "auto"
 
         try:
+            # If streaming with callback, use _stream_chat to collect tool_calls
+            if stream and on_stream_chunk:
+                return await self._stream_chat(kwargs, on_stream_chunk)
+
             response = await acompletion(**kwargs)
+            
+            # If streaming without callback, return the async generator directly
+            if stream:
+                return response  # type: ignore
+            
             return self._parse_response(response)
         except Exception as e:
             # Return error as content for graceful handling
@@ -250,6 +264,108 @@ class LiteLLMProvider(LLMProvider):
                 content=f"Error calling LLM: {str(e)}",
                 finish_reason="error",
             )
+
+    async def _stream_chat(
+        self,
+        kwargs: dict[str, Any],
+        on_stream_chunk: Callable[[str], Awaitable[None]] | None = None,
+    ) -> LLMResponse:
+        """
+        Stream chat completion and collect full response including tool_calls.
+
+        This allows streaming content to user while still collecting tool_calls
+        for the agent loop to process.
+        """
+        kwargs["stream"] = True
+
+        content_parts: list[str] = []
+        tool_calls_map: dict[int, dict] = {}  # index -> {id, name, arguments}
+        finish_reason = "stop"
+        usage: dict[str, Any] = {}
+
+        async for chunk in await acompletion(**kwargs):
+            choice = chunk.choices[0] if chunk.choices else None
+            if not choice:
+                continue
+
+            delta = choice.delta
+
+            # Collect content
+            if delta.content:
+                content_parts.append(delta.content)
+                if on_stream_chunk:
+                    try:
+                        # Send accumulated content, not just the delta
+                        accumulated = "".join(content_parts)
+                        await on_stream_chunk(accumulated)
+                    except Exception as e:
+                        # Log but continue - don't fail the whole request
+                        import warnings
+                        warnings.warn(f"Stream chunk callback failed: {e}")
+                        on_stream_chunk = None
+
+            # Collect tool_calls (merge fragments by index)
+            if hasattr(delta, "tool_calls") and delta.tool_calls:
+                for tc in delta.tool_calls:
+                    idx = tc.index
+                    if idx not in tool_calls_map:
+                        tool_calls_map[idx] = {
+                            "id": tc.id or "",
+                            "name": tc.function.name if tc.function else "",
+                            "arguments": "",
+                        }
+                    if tc.id:
+                        tool_calls_map[idx]["id"] = tc.id
+                    if tc.function:
+                        if tc.function.name:
+                            tool_calls_map[idx]["name"] = tc.function.name
+                        if tc.function.arguments:
+                            tool_calls_map[idx]["arguments"] += tc.function.arguments
+
+            # Get finish_reason
+            if choice.finish_reason:
+                finish_reason = choice.finish_reason
+
+            # Get usage (usually in last chunk)
+            if hasattr(chunk, "usage") and chunk.usage:
+                usage = self._extract_usage(chunk.usage)
+
+        # Build tool_calls list
+        tool_calls = []
+        for idx in sorted(tool_calls_map.keys()):
+            tc_data = tool_calls_map[idx]
+            args = tc_data["arguments"]
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except json.JSONDecodeError:
+                    args = {"raw": args}
+            tool_calls.append(
+                ToolCallRequest(
+                    id=tc_data["id"] or _short_tool_id(),
+                    name=tc_data["name"],
+                    arguments=args,
+                )
+            )
+
+        content = "".join(content_parts) if content_parts else None
+
+        response = LLMResponse(
+            content=content,
+            tool_calls=tool_calls,
+            finish_reason=finish_reason or "stop",
+            usage=usage,
+        )
+
+        return response
+
+    def _extract_usage(self, usage: Any) -> dict[str, int]:
+        """Extract usage info from response."""
+        return {
+            "prompt_tokens": getattr(usage, "prompt_tokens", 0) or 0,
+            "completion_tokens": getattr(usage, "completion_tokens", 0) or 0,
+            "total_tokens": getattr(usage, "total_tokens", 0) or 0,
+        }
 
     def _parse_response(self, response: Any) -> LLMResponse:
         """Parse LiteLLM response into our standard format."""

@@ -191,13 +191,20 @@ class AgentLoop:
         while iteration < self.max_iterations:
             iteration += 1
 
+            # Stream only on first iteration - allows real-time output while
+            # still collecting tool_calls. After tool calls, use draft-based streaming.
+            stream_this_turn = on_progress is not None and iteration == 1
+            has_tools = bool(self.tools.get_definitions())
+
             response = await self.provider.chat(
                 messages=messages,
-                tools=self.tools.get_definitions(),
+                tools=self.tools.get_definitions() if has_tools else None,
                 model=self.model,
                 temperature=self.temperature,
                 max_tokens=self.max_tokens,
                 reasoning_effort=self.reasoning_effort,
+                stream=stream_this_turn,
+                on_stream_chunk=on_progress if stream_this_turn else None,
             )
 
             if response.has_tool_calls:
@@ -234,8 +241,7 @@ class AgentLoop:
                     )
             else:
                 clean = self._strip_think(response.content)
-                # Don't persist error responses to session history — they can
-                # poison the context and cause permanent 400 loops (#1303).
+                # Don't persist error responses to session history
                 if response.finish_reason == "error":
                     logger.error("LLM returned error: {}", (clean or "")[:200])
                     final_content = clean or "Sorry, I encountered an error calling the AI model."
@@ -244,6 +250,7 @@ class AgentLoop:
                     messages, clean, reasoning_content=response.reasoning_content,
                     thinking_blocks=response.thinking_blocks,
                 )
+                # Return content for finalize (telegram.py handles duplicate prevention via had_draft check)
                 final_content = clean
                 break
 
@@ -255,6 +262,7 @@ class AgentLoop:
             )
 
         return final_content, tools_used, messages
+
 
     async def run(self) -> None:
         """Run the agent loop, dispatching messages as tasks to stay responsive to /stop."""

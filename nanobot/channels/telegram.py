@@ -132,9 +132,10 @@ class TelegramChannel(BaseChannel):
         self._media_group_buffers: dict[str, dict] = {}
         self._media_group_tasks: dict[str, asyncio.Task] = {}
         # Streaming draft support
-        self._draft_ids: dict[str, int] = {}  # chat_id -> current draft_id
+        self._draft_ids: dict[str, int] = {}  # chat_id -> base draft_id (increments per message)
         self._draft_contents: dict[str, str] = {}  # chat_id -> last sent draft content
         self._draft_locks: dict[str, asyncio.Lock] = {}  # chat_id -> lock for draft operations
+        self._message_counters: dict[str, int] = {}  # chat_id -> message counter for unique draft_ids
 
     async def start(self) -> None:
         """Start the Telegram bot with long polling."""
@@ -236,13 +237,32 @@ class TelegramChannel(BaseChannel):
 
         # Handle streaming progress messages with send_message_draft
         is_progress = msg.metadata.get("_progress", False)
+        logger.debug(f"[TELEGRAM DEBUG] send() called: chat_id={msg.chat_id}, is_progress={is_progress}, content[:30]={msg.content[:30] if msg.content else None}...")
 
         if is_progress:
             await self._send_draft(msg)
             return
 
-        # Final message - stop typing and clear any draft
+        # Final message - stop typing
         self._stop_typing(msg.chat_id)
+
+        # Check if we need to finalize a draft
+        try:
+            chat_id = int(msg.chat_id)
+        except ValueError:
+            logger.error("Invalid chat_id: {}", msg.chat_id)
+            return
+
+        had_draft = self._draft_contents.get(chat_id, False)
+        logger.info(f"[TELEGRAM] Final message check: chat_id={chat_id}, had_draft={had_draft}, draft_contents_keys={list(self._draft_contents.keys())}")
+
+        if had_draft:
+            # Finalize draft (send permanent message and clear draft state)
+            logger.info(f"[TELEGRAM] Calling _finalize_draft for chat_id={chat_id}")
+            await self._finalize_draft(msg)
+            return  # Important: return to avoid duplicate send
+
+        # No draft - proceed with normal message sending
         await self._clear_draft(msg.chat_id)
 
         try:
@@ -359,6 +379,11 @@ class TelegramChannel(BaseChannel):
         # Store chat_id for replies
         self._chat_ids[sender_id] = chat_id
 
+        # Clear draft state when receiving new message to avoid false "had_draft" detection
+        # This prevents the bug where residual draft state causes messages not to send
+        str_chat_id = str(chat_id)
+        await self._clear_draft(str_chat_id)
+
         # Build content from text and/or media
         content_parts = []
         media_paths = []
@@ -423,8 +448,6 @@ class TelegramChannel(BaseChannel):
         content = "\n".join(content_parts) if content_parts else "[empty message]"
 
         logger.debug("Telegram message from {}: {}...", sender_id, content[:50])
-
-        str_chat_id = str(chat_id)
 
         # Telegram media groups: buffer briefly, forward as one aggregated turn.
         if media_group_id := getattr(message, "media_group_id", None):
@@ -510,8 +533,13 @@ class TelegramChannel(BaseChannel):
         This creates an animated "typing" effect showing partial content
         as it's being generated, using Telegram's native draft streaming.
         Falls back to typing indicator if stream_drafts is disabled.
+
+        IMPORTANT: msg.content is an INCREMENTAL chunk from LLM streaming,
+        not the full accumulated content. We must accumulate it here.
         """
+        logger.debug(f"[TELEGRAM DEBUG] _send_draft called: chat_id={msg.chat_id}, chunk[:20]={msg.content[:20] if msg.content else None}...")
         if not self._app:
+            logger.warning("[TELEGRAM DEBUG] _send_draft: no app")
             return
 
         # Check if streaming drafts are enabled
@@ -531,45 +559,135 @@ class TelegramChannel(BaseChannel):
             self._draft_locks[chat_id] = asyncio.Lock()
 
         async with self._draft_locks[chat_id]:
-            # Get or create draft_id for this chat (increments for each new conversation)
-            if chat_id not in self._draft_ids:
-                self._draft_ids[chat_id] = int(time.time() * 1000) % 1000000
-
-            draft_id = self._draft_ids[chat_id]
-
-            # Skip if content hasn't changed significantly
-            last_content = self._draft_contents.get(chat_id, "")
-            if msg.content == last_content or (
-                len(msg.content) < 50 and msg.content.startswith(last_content)
-            ):
+            # Skip empty content to avoid "Text must be non-empty" error
+            if not msg.content or not msg.content.strip():
                 return
 
+            # msg.content is ALREADY accumulated by LiteLLMProvider._stream_chat()
+            # No need to accumulate here - just use it directly
+            accumulated = msg.content
+            logger.debug(f"[TELEGRAM DEBUG] Using accumulated content from LLM: len={len(accumulated)}")
+
+            # Check if this is a new message (no existing draft_id for this chat)
+            is_new_message = chat_id not in self._draft_ids
+
+            # Generate unique draft_id ONLY for new messages
+            # Keep the same draft_id for subsequent updates of the same message
+            if is_new_message:
+                if chat_id not in self._message_counters:
+                    self._message_counters[chat_id] = 0
+                self._message_counters[chat_id] += 1
+                # Create unique draft_id: base_timestamp + message_counter
+                base_id = int(time.time() * 1000) % 1000000
+                new_draft_id = base_id + self._message_counters[chat_id] * 1000
+                self._draft_ids[chat_id] = new_draft_id  # Store for reuse
+                logger.debug(f"[TELEGRAM DEBUG] New message, created draft_id={new_draft_id}")
+
+            # Reuse the stored draft_id for updates
+            draft_id = self._draft_ids.get(chat_id)
+            if not draft_id:
+                logger.error("[TELEGRAM DEBUG] No draft_id found for update, skipping")
+                return
+
+            # Rate limiting: only send every 300ms to avoid Flood Control
+            if not hasattr(self, '_last_draft_time'):
+                self._last_draft_time: dict[int, float] = {}
+            now = time.time()
+            last_time = self._last_draft_time.get(chat_id, 0)
+            min_interval = 0.3  # 300ms between draft updates
+
+            # Skip if too soon (unless it's the first chunk)
+            if now - last_time < min_interval and not is_new_message:
+                # Skip sending but mark that we have a draft
+                self._draft_contents[chat_id] = True
+                return
+
+            # Send the full accumulated content as draft
+            # Finalize will clear the draft and send permanent message
+            draft_text = accumulated
+
             # Limit content length for draft (Telegram has limits)
-            draft_text = msg.content[:4000] if len(msg.content) > 4000 else msg.content
+            draft_text = draft_text[:4000] if len(draft_text) > 4000 else draft_text
 
             # Convert markdown to HTML for better formatting
             html = _markdown_to_telegram_html(draft_text)
 
             try:
+                logger.debug(f"[TELEGRAM DEBUG] Sending draft: chat_id={chat_id}, draft_id={draft_id}, content[:30]={draft_text[:30]}...")
                 await self._app.bot.send_message_draft(
                     chat_id=chat_id,
                     draft_id=draft_id,
                     text=html,
                     parse_mode="HTML",
                 )
-                self._draft_contents[chat_id] = msg.content
+                logger.debug(f"[TELEGRAM DEBUG] Draft sent successfully!")
+                logger.info(f"[TELEGRAM] Draft sent and marked: chat_id={chat_id}")
+                self._draft_contents[chat_id] = True  # Mark that we have a draft
+                self._draft_ids[chat_id] = draft_id  # Store current draft_id for finalization
+                self._last_draft_time[chat_id] = time.time()  # Track for rate limiting
             except Exception as e:
-                logger.debug("Draft send failed (non-critical): {}", e)
+                logger.warning("[TELEGRAM DEBUG] Draft send failed: {}", e)
 
     async def _clear_draft(self, chat_id: str) -> None:
         """Clear draft state after final message is sent."""
         try:
             cid = int(chat_id)
             self._draft_contents.pop(cid, None)
-            # Generate new draft_id for next conversation
-            self._draft_ids[cid] = int(time.time() * 1000) % 1000000
+            self._draft_ids.pop(cid, None)
+            # Keep message counter for next message (don't reset)
         except ValueError:
             pass
+
+    async def _finalize_draft(self, msg: OutboundMessage) -> None:
+        """Finalize draft by clearing it and sending a permanent message.
+
+        Flow:
+        1. Send empty draft to clear the streaming draft
+        2. Send permanent message with complete content
+        This ensures user sees only ONE message (no duplicate).
+        """
+        try:
+            chat_id = int(msg.chat_id)
+        except ValueError:
+            logger.error("Invalid chat_id: {}", msg.chat_id)
+            return
+
+        # Get the draft_id for this chat
+        draft_id = self._draft_ids.get(chat_id)
+
+        # Step 1: Clear the draft by sending empty content
+        # This makes the draft disappear before we send the permanent message
+        if draft_id:
+            try:
+                logger.info(f"[TELEGRAM] Clearing draft with empty content: chat_id={chat_id}")
+                await self._app.bot.send_message_draft(
+                    chat_id=chat_id,
+                    draft_id=draft_id,
+                    text="",
+                )
+                logger.info(f"[TELEGRAM] Draft cleared, waiting 500ms before sending permanent message")
+                # Wait for draft to disappear from user's view
+                await asyncio.sleep(0.5)  # 500ms delay
+            except Exception as e:
+                logger.warning("[TELEGRAM] Failed to clear draft: {}", e)
+
+        # Step 2: Send permanent message with complete content
+        if msg.content and msg.content.strip():
+            html = _markdown_to_telegram_html(msg.content)
+            try:
+                logger.info(f"[TELEGRAM] Sending permanent message: chat_id={chat_id}")
+                await self._app.bot.send_message(
+                    chat_id=chat_id,
+                    text=html,
+                    parse_mode="HTML",
+                    disable_web_page_preview=msg.metadata.get("disable_web_page_preview", False),
+                )
+                logger.info(f"[TELEGRAM] Permanent message sent successfully")
+            except Exception as e:
+                logger.warning("[TELEGRAM] Failed to send permanent message: {}", e)
+
+        # Clear draft state
+        await self._clear_draft(msg.chat_id)
 
     async def _on_error(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Log polling / handler errors instead of silently swallowing them."""
