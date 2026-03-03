@@ -642,10 +642,10 @@ class TelegramChannel(BaseChannel):
             pass
 
     async def _finalize_draft(self, msg: OutboundMessage) -> None:
-        """Finalize draft by sending the complete content as the last draft update.
+        """Finalize draft by sending a permanent message.
 
-        This ensures the user sees the full message (including the last few chars
-        that were truncated during streaming). The draft will persist as a visible message.
+        The draft provides streaming effect, then this sends the permanent message.
+        Draft will be reclaimed by Telegram, leaving only the permanent message.
         """
         try:
             chat_id = int(msg.chat_id)
@@ -653,30 +653,22 @@ class TelegramChannel(BaseChannel):
             logger.error("Invalid chat_id: {}", msg.chat_id)
             return
 
-        # Get the draft_id for this chat
-        draft_id = self._draft_ids.get(chat_id)
-        if not draft_id:
-            logger.warning("[TELEGRAM] No draft_id found for finalization")
-            await self._clear_draft(msg.chat_id)
-            return
-
-        # Send the complete content as the final draft update
-        # This includes the last few characters that were truncated during streaming
+        # Send permanent message with complete content
         if msg.content and msg.content.strip():
             html = _markdown_to_telegram_html(msg.content)
             try:
-                logger.info(f"[TELEGRAM] Finalizing draft with complete content: chat_id={chat_id}")
-                await self._app.bot.send_message_draft(
+                logger.info(f"[TELEGRAM] Sending permanent message: chat_id={chat_id}")
+                await self._app.bot.send_message(
                     chat_id=chat_id,
-                    draft_id=draft_id,
                     text=html,
                     parse_mode="HTML",
+                    disable_web_page_preview=msg.metadata.get("disable_web_page_preview", False),
                 )
-                logger.info(f"[TELEGRAM] Draft finalized successfully")
+                logger.info(f"[TELEGRAM] Permanent message sent successfully")
             except Exception as e:
-                logger.warning("[TELEGRAM] Failed to finalize draft: {}", e)
+                logger.warning("[TELEGRAM] Failed to send permanent message: {}", e)
 
-        # Clear draft state
+        # Clear draft state (draft will be reclaimed by Telegram)
         await self._clear_draft(msg.chat_id)
 
     async def _on_error(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
