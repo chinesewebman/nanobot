@@ -531,8 +531,11 @@ class TelegramChannel(BaseChannel):
         This creates an animated "typing" effect showing partial content
         as it's being generated, using Telegram's native draft streaming.
         Falls back to typing indicator if stream_drafts is disabled.
+
+        IMPORTANT: msg.content is an INCREMENTAL chunk from LLM streaming,
+        not the full accumulated content. We must accumulate it here.
         """
-        logger.debug(f"[TELEGRAM DEBUG] _send_draft called: chat_id={msg.chat_id}, stream_drafts={self.config.stream_drafts}")
+        logger.debug(f"[TELEGRAM DEBUG] _send_draft called: chat_id={msg.chat_id}, chunk[:20]={msg.content[:20] if msg.content else None}...")
         if not self._app:
             logger.warning("[TELEGRAM DEBUG] _send_draft: no app")
             return
@@ -554,30 +557,51 @@ class TelegramChannel(BaseChannel):
             self._draft_locks[chat_id] = asyncio.Lock()
 
         async with self._draft_locks[chat_id]:
-            # Generate unique draft_id for each message (using counter + timestamp)
-            # This ensures each message gets its own draft_id, preventing overlap
-            if chat_id not in self._message_counters:
-                self._message_counters[chat_id] = 0
-            
-            # Only increment counter when content is empty (new message starting)
-            if chat_id not in self._draft_contents or not self._draft_contents.get(chat_id):
-                self._message_counters[chat_id] += 1
-            
-            # Create unique draft_id: base_timestamp + message_counter
-            base_id = int(time.time() * 1000) % 1000000
-            draft_id = base_id + self._message_counters[chat_id] * 1000
-
-            # Skip if content hasn't changed significantly
-            last_content = self._draft_contents.get(chat_id, "")
-            if msg.content == last_content:
+            # Skip empty content to avoid "Text must be non-empty" error
+            if not msg.content or not msg.content.strip():
                 return
-            # Only skip if we have previous content and new content starts with it
-            # This allows the first chunk to always be sent
-            if last_content and len(msg.content) < 50 and msg.content.startswith(last_content):
+
+            # ACCUMULATE: msg.content is incremental chunk, append to previous
+            last_content = self._draft_contents.get(chat_id, "")
+            accumulated = last_content + msg.content
+            logger.debug(f"[TELEGRAM DEBUG] Accumulated: last={len(last_content)}, chunk={len(msg.content)}, total={len(accumulated)}")
+
+            # Check if this is a new message (no previous draft content)
+            is_new_message = not last_content
+
+            # Generate unique draft_id ONLY for new messages
+            # Keep the same draft_id for subsequent updates of the same message
+            if is_new_message:
+                if chat_id not in self._message_counters:
+                    self._message_counters[chat_id] = 0
+                self._message_counters[chat_id] += 1
+                # Create unique draft_id: base_timestamp + message_counter
+                base_id = int(time.time() * 1000) % 1000000
+                new_draft_id = base_id + self._message_counters[chat_id] * 1000
+                self._draft_ids[chat_id] = new_draft_id  # Store for reuse
+                logger.debug(f"[TELEGRAM DEBUG] New message, created draft_id={new_draft_id}")
+
+            # Reuse the stored draft_id for updates
+            draft_id = self._draft_ids.get(chat_id)
+            if not draft_id:
+                logger.error("[TELEGRAM DEBUG] No draft_id found for update, skipping")
+                return
+
+            # Rate limiting: only send every 300ms to avoid Flood Control
+            if not hasattr(self, '_last_draft_time'):
+                self._last_draft_time: dict[int, float] = {}
+            now = time.time()
+            last_time = self._last_draft_time.get(chat_id, 0)
+            min_interval = 0.3  # 300ms between draft updates
+
+            # Skip if too soon (unless it's the first chunk)
+            if now - last_time < min_interval and not is_new_message:
+                # Still accumulate content even if we skip sending
+                self._draft_contents[chat_id] = accumulated
                 return
 
             # Limit content length for draft (Telegram has limits)
-            draft_text = msg.content[:4000] if len(msg.content) > 4000 else msg.content
+            draft_text = accumulated[:4000] if len(accumulated) > 4000 else accumulated
 
             # Convert markdown to HTML for better formatting
             html = _markdown_to_telegram_html(draft_text)
@@ -591,8 +615,9 @@ class TelegramChannel(BaseChannel):
                     parse_mode="HTML",
                 )
                 logger.debug(f"[TELEGRAM DEBUG] Draft sent successfully!")
-                self._draft_contents[chat_id] = msg.content
+                self._draft_contents[chat_id] = accumulated  # Store accumulated content
                 self._draft_ids[chat_id] = draft_id  # Store current draft_id for finalization
+                self._last_draft_time[chat_id] = time.time()  # Track for rate limiting
             except Exception as e:
                 logger.warning("[TELEGRAM DEBUG] Draft send failed: {}", e)
 

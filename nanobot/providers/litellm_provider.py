@@ -295,7 +295,9 @@ class LiteLLMProvider(LLMProvider):
                 content_parts.append(delta.content)
                 if on_stream_chunk:
                     try:
-                        await on_stream_chunk(delta.content)
+                        # Send accumulated content, not just the delta
+                        accumulated = "".join(content_parts)
+                        await on_stream_chunk(accumulated)
                     except Exception as e:
                         # Log but continue - don't fail the whole request
                         import warnings

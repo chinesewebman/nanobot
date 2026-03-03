@@ -250,8 +250,8 @@ class AgentLoop:
                     messages, clean, reasoning_content=response.reasoning_content,
                     thinking_blocks=response.thinking_blocks,
                 )
-                # If we streamed, don't return content again (avoid duplicate)
-                final_content = None if stream_this_turn else clean
+                # Return content for finalize (telegram.py handles duplicate prevention via had_draft check)
+                final_content = clean
                 break
 
         if final_content is None and iteration >= self.max_iterations:
