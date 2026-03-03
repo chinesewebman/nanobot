@@ -642,12 +642,41 @@ class TelegramChannel(BaseChannel):
             pass
 
     async def _finalize_draft(self, msg: OutboundMessage) -> None:
-        """Finalize draft - just clear state, don't send duplicate message.
+        """Finalize draft by sending the complete content as the last draft update.
 
-        The draft itself is already showing the complete content.
-        Telegram will keep it visible (tested - drafts persist).
+        This ensures the user sees the full message (including the last few chars
+        that were truncated during streaming). The draft will persist as a visible message.
         """
-        logger.info(f"[TELEGRAM] _finalize_draft: clearing draft state for chat_id={msg.chat_id}")
+        try:
+            chat_id = int(msg.chat_id)
+        except ValueError:
+            logger.error("Invalid chat_id: {}", msg.chat_id)
+            return
+
+        # Get the draft_id for this chat
+        draft_id = self._draft_ids.get(chat_id)
+        if not draft_id:
+            logger.warning("[TELEGRAM] No draft_id found for finalization")
+            await self._clear_draft(msg.chat_id)
+            return
+
+        # Send the complete content as the final draft update
+        # This includes the last few characters that were truncated during streaming
+        if msg.content and msg.content.strip():
+            html = _markdown_to_telegram_html(msg.content)
+            try:
+                logger.info(f"[TELEGRAM] Finalizing draft with complete content: chat_id={chat_id}")
+                await self._app.bot.send_message_draft(
+                    chat_id=chat_id,
+                    draft_id=draft_id,
+                    text=html,
+                    parse_mode="HTML",
+                )
+                logger.info(f"[TELEGRAM] Draft finalized successfully")
+            except Exception as e:
+                logger.warning("[TELEGRAM] Failed to finalize draft: {}", e)
+
+        # Clear draft state
         await self._clear_draft(msg.chat_id)
 
     async def _on_error(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
