@@ -642,43 +642,12 @@ class TelegramChannel(BaseChannel):
             pass
 
     async def _finalize_draft(self, msg: OutboundMessage) -> None:
-        """Finalize draft by sending a permanent message to replace the temporary draft.
+        """Finalize draft - just clear state, don't send duplicate message.
 
-        This prevents Telegram from recycling the draft message.
+        The draft itself is already showing the complete content.
+        Telegram will keep it visible (tested - drafts persist).
         """
-        try:
-            chat_id = int(msg.chat_id)
-        except ValueError:
-            logger.error("Invalid chat_id: {}", msg.chat_id)
-            return
-
-        # Check if we had a draft for this chat
-        had_draft = self._draft_contents.get(chat_id, False)
-
-        # If we had a draft, send the final message to make it permanent
-        if had_draft:
-            logger.info(f"[TELEGRAM] _finalize_draft: sending permanent message for chat_id={chat_id}, content_len={len(msg.content) if msg.content else 0}")
-
-            # Send the final permanent message
-            if msg.content and msg.content != "[empty message]":
-                try:
-                    html = _markdown_to_telegram_html(msg.content)
-                    await self._app.bot.send_message(
-                        chat_id=chat_id,
-                        text=html,
-                        parse_mode="HTML",
-                    )
-                except Exception as e:
-                    logger.warning("HTML parse failed in finalize, falling back to plain text: {}", e)
-                    try:
-                        await self._app.bot.send_message(
-                            chat_id=chat_id,
-                            text=msg.content,
-                        )
-                    except Exception as e2:
-                        logger.error("Error sending final message: {}", e2)
-
-        # Clear draft state regardless (including draft_id to prevent reuse)
+        logger.info(f"[TELEGRAM] _finalize_draft: clearing draft state for chat_id={msg.chat_id}")
         await self._clear_draft(msg.chat_id)
 
     async def _on_error(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
