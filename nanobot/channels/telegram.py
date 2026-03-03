@@ -602,12 +602,9 @@ class TelegramChannel(BaseChannel):
                 self._draft_contents[chat_id] = True
                 return
 
-            # Don't send the last few characters - leave that for finalize
-            # This prevents duplicate display (draft + finalize both showing full content)
-            if len(accumulated) > 50:
-                draft_text = accumulated[:-10]  # Leave last 10 chars for finalize
-            else:
-                draft_text = accumulated  # For short messages, send all to draft
+            # Send the full accumulated content as draft
+            # Finalize will clear the draft and send permanent message
+            draft_text = accumulated
 
             # Limit content length for draft (Telegram has limits)
             draft_text = draft_text[:4000] if len(draft_text) > 4000 else draft_text
