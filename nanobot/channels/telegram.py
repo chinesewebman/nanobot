@@ -642,10 +642,11 @@ class TelegramChannel(BaseChannel):
             pass
 
     async def _finalize_draft(self, msg: OutboundMessage) -> None:
-        """Finalize draft by sending a permanent message.
+        """Finalize draft by clearing it with empty content, then send permanent message.
 
-        The draft provides streaming effect, then this sends the permanent message.
-        Draft will be reclaimed by Telegram, leaving only the permanent message.
+        1. Send empty draft to clear the streaming draft (Telegram replaces draft with empty)
+        2. Send complete content via regular send_message for permanent storage
+        This ensures user sees only one message (no duplicate).
         """
         try:
             chat_id = int(msg.chat_id)
@@ -653,7 +654,23 @@ class TelegramChannel(BaseChannel):
             logger.error("Invalid chat_id: {}", msg.chat_id)
             return
 
-        # Send permanent message with complete content
+        # Get the draft_id for this chat
+        draft_id = self._draft_ids.get(chat_id)
+
+        # Step 1: Clear the draft by sending empty content
+        if draft_id:
+            try:
+                logger.info(f"[TELEGRAM] Clearing draft with empty content: chat_id={chat_id}")
+                await self._app.bot.send_message_draft(
+                    chat_id=chat_id,
+                    draft_id=draft_id,
+                    text="",
+                )
+                logger.info(f"[TELEGRAM] Draft cleared successfully")
+            except Exception as e:
+                logger.warning("[TELEGRAM] Failed to clear draft: {}", e)
+
+        # Step 2: Send permanent message with complete content
         if msg.content and msg.content.strip():
             html = _markdown_to_telegram_html(msg.content)
             try:
@@ -668,7 +685,7 @@ class TelegramChannel(BaseChannel):
             except Exception as e:
                 logger.warning("[TELEGRAM] Failed to send permanent message: {}", e)
 
-        # Clear draft state (draft will be reclaimed by Telegram)
+        # Clear draft state
         await self._clear_draft(msg.chat_id)
 
     async def _on_error(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
