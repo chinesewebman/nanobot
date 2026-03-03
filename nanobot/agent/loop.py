@@ -251,7 +251,7 @@ class AgentLoop:
                     thinking_blocks=response.thinking_blocks,
                 )
                 # If we streamed, don't return content again (avoid duplicate)
-                final_content = None if use_stream else clean
+                final_content = None if stream_this_turn else clean
                 break
 
         if final_content is None and iteration >= self.max_iterations:

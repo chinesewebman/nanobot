@@ -237,6 +237,7 @@ class TelegramChannel(BaseChannel):
 
         # Handle streaming progress messages with send_message_draft
         is_progress = msg.metadata.get("_progress", False)
+        logger.debug(f"[TELEGRAM DEBUG] send() called: chat_id={msg.chat_id}, is_progress={is_progress}, content[:30]={msg.content[:30] if msg.content else None}...")
 
         if is_progress:
             await self._send_draft(msg)
@@ -531,7 +532,9 @@ class TelegramChannel(BaseChannel):
         as it's being generated, using Telegram's native draft streaming.
         Falls back to typing indicator if stream_drafts is disabled.
         """
+        logger.debug(f"[TELEGRAM DEBUG] _send_draft called: chat_id={msg.chat_id}, stream_drafts={self.config.stream_drafts}")
         if not self._app:
+            logger.warning("[TELEGRAM DEBUG] _send_draft: no app")
             return
 
         # Check if streaming drafts are enabled
@@ -566,9 +569,11 @@ class TelegramChannel(BaseChannel):
 
             # Skip if content hasn't changed significantly
             last_content = self._draft_contents.get(chat_id, "")
-            if msg.content == last_content or (
-                len(msg.content) < 50 and msg.content.startswith(last_content)
-            ):
+            if msg.content == last_content:
+                return
+            # Only skip if we have previous content and new content starts with it
+            # This allows the first chunk to always be sent
+            if last_content and len(msg.content) < 50 and msg.content.startswith(last_content):
                 return
 
             # Limit content length for draft (Telegram has limits)
@@ -578,16 +583,18 @@ class TelegramChannel(BaseChannel):
             html = _markdown_to_telegram_html(draft_text)
 
             try:
+                logger.debug(f"[TELEGRAM DEBUG] Sending draft: chat_id={chat_id}, draft_id={draft_id}, content[:30]={draft_text[:30]}...")
                 await self._app.bot.send_message_draft(
                     chat_id=chat_id,
                     draft_id=draft_id,
                     text=html,
                     parse_mode="HTML",
                 )
+                logger.debug(f"[TELEGRAM DEBUG] Draft sent successfully!")
                 self._draft_contents[chat_id] = msg.content
                 self._draft_ids[chat_id] = draft_id  # Store current draft_id for finalization
             except Exception as e:
-                logger.debug("Draft send failed (non-critical): {}", e)
+                logger.warning("[TELEGRAM DEBUG] Draft send failed: {}", e)
 
     async def _clear_draft(self, chat_id: str) -> None:
         """Clear draft state after final message is sent."""
