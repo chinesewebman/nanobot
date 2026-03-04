@@ -191,44 +191,14 @@ class AgentLoop:
         while iteration < self.max_iterations:
             iteration += 1
 
-            # Use streaming when: has progress callback AND no tools available
-            # (tools need full response to parse tool_calls)
-            has_tools = bool(self.tools.get_definitions())
-            use_stream = on_progress is not None and not has_tools
-
             response = await self.provider.chat(
                 messages=messages,
-                tools=self.tools.get_definitions() if has_tools else None,
+                tools=self.tools.get_definitions(),
                 model=self.model,
                 temperature=self.temperature,
                 max_tokens=self.max_tokens,
                 reasoning_effort=self.reasoning_effort,
-                stream=use_stream,
             )
-
-            # Handle streaming response - collect chunks in real-time
-            if use_stream and hasattr(response, '__aiter__'):
-                full_content = ""
-                finish_reason = "stop"
-
-                async for chunk in response:
-                    if chunk.choices[0].delta.content:
-                        content = chunk.choices[0].delta.content
-                        full_content += content
-                        # Stream to user immediately
-                        if on_progress:
-                            await on_progress(content)
-
-                    if chunk.choices[0].finish_reason:
-                        finish_reason = chunk.choices[0].finish_reason
-
-                # Build LLMResponse from collected stream
-                from nanobot.providers.base import LLMResponse
-                response = LLMResponse(
-                    content=full_content,
-                    tool_calls=[],
-                    finish_reason=finish_reason,
-                )
 
             if response.has_tool_calls:
                 if on_progress:
@@ -264,7 +234,8 @@ class AgentLoop:
                     )
             else:
                 clean = self._strip_think(response.content)
-                # Don't persist error responses to session history
+                # Don't persist error responses to session history — they can
+                # poison the context and cause permanent 400 loops (#1303).
                 if response.finish_reason == "error":
                     logger.error("LLM returned error: {}", (clean or "")[:200])
                     final_content = clean or "Sorry, I encountered an error calling the AI model."
@@ -273,8 +244,7 @@ class AgentLoop:
                     messages, clean, reasoning_content=response.reasoning_content,
                     thinking_blocks=response.thinking_blocks,
                 )
-                # If we streamed, don't return content again (avoid duplicate)
-                final_content = None if use_stream else clean
+                final_content = clean
                 break
 
         if final_content is None and iteration >= self.max_iterations:
@@ -285,7 +255,6 @@ class AgentLoop:
             )
 
         return final_content, tools_used, messages
-
 
     async def run(self) -> None:
         """Run the agent loop, dispatching messages as tasks to stay responsive to /stop."""
@@ -456,6 +425,9 @@ class AgentLoop:
         )
 
         async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
+            # Only send streaming progress to channels that support it
+            if msg.channel not in ("telegram", "discord"):
+                return
             meta = dict(msg.metadata or {})
             meta["_progress"] = True
             meta["_tool_hint"] = tool_hint
